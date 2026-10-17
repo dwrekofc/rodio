@@ -24,11 +24,14 @@ use crate::mixer::{mixer, Mixer};
 use crate::player::Player;
 use crate::{decoder, Source};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, Sample, SampleFormat, StreamConfig, I24};
+use cpal::{BufferSize, SampleFormat, StreamConfig, I24};
 use std::fmt;
 use std::io::{Read, Seek};
 use std::marker::Sync;
 use std::num::NonZero;
+use std::sync::Arc;
+mod output_observer;
+pub use output_observer::{OutputBufferCallback, OutputBufferEvent};
 
 const HZ_44100: SampleRate = nz!(44_100);
 
@@ -181,6 +184,7 @@ where
     device: Option<cpal::Device>,
     config: DeviceSinkConfig,
     error_callback: E,
+    output_callback: Option<Arc<OutputBufferCallback>>,
 }
 
 impl Default for DeviceSinkBuilder {
@@ -189,6 +193,7 @@ impl Default for DeviceSinkBuilder {
             device: None,
             config: DeviceSinkConfig::default(),
             error_callback: default_error_callback,
+            output_callback: None,
         }
     }
 }
@@ -231,8 +236,27 @@ impl DeviceSinkBuilder {
     /// output devices. Returns stream for first of the tried configurations that succeeds.
     /// If all attempts fail return the initial error.
     pub fn open_default_sink() -> Result<MixerDeviceSink, DeviceSinkError> {
+        Self::open_default_sink_with_shared_callback(None)
+    }
+
+    /// Open the default/fallback sink and observe its actual output buffer boundaries.
+    pub fn open_default_sink_with_output_callback<F>(
+        callback: F,
+    ) -> Result<MixerDeviceSink, DeviceSinkError>
+    where
+        F: Fn(OutputBufferEvent) + Send + Sync + 'static,
+    {
+        Self::open_default_sink_with_shared_callback(Some(Arc::new(callback)))
+    }
+
+    fn open_default_sink_with_shared_callback(
+        callback: Option<Arc<OutputBufferCallback>>,
+    ) -> Result<MixerDeviceSink, DeviceSinkError> {
         Self::from_default_device()
-            .and_then(|x| x.open_stream())
+            .and_then(|x| {
+                x.with_shared_output_callback(callback.clone())
+                    .open_stream()
+            })
             .or_else(|original_err| {
                 let devices = match cpal::default_host().output_devices() {
                     Ok(devices) => devices,
@@ -252,7 +276,10 @@ impl DeviceSinkBuilder {
                     })
                     .find_map(|d| {
                         Self::from_device(d)
-                            .and_then(|x| x.open_sink_or_fallback())
+                            .and_then(|x| {
+                                x.with_shared_output_callback(callback.clone())
+                                    .open_sink_or_fallback()
+                            })
                             .ok()
                     })
                     .ok_or(original_err)
@@ -373,14 +400,36 @@ where
             device: self.device,
             config: self.config,
             error_callback: callback,
+            output_callback: self.output_callback,
         }
+    }
+
+    /// Observe output callback buffers and frame boundaries. The callback runs on the audio thread.
+    pub fn with_output_callback<F>(self, callback: F) -> Self
+    where
+        F: Fn(OutputBufferEvent) + Send + Sync + 'static,
+    {
+        self.with_shared_output_callback(Some(Arc::new(callback)))
+    }
+
+    fn with_shared_output_callback(mut self, callback: Option<Arc<OutputBufferCallback>>) -> Self {
+        self.output_callback = callback;
+        self
     }
 
     /// Open OS-Sink using parameters configured so far.
     pub fn open_stream(self) -> Result<MixerDeviceSink, DeviceSinkError> {
         let device = self.device.as_ref().expect("No output device specified");
 
-        MixerDeviceSink::open(device, &self.config, self.error_callback)
+        match self.output_callback {
+            None => MixerDeviceSink::open(device, &self.config, self.error_callback),
+            callback => MixerDeviceSink::open_with_output_callback(
+                device,
+                &self.config,
+                self.error_callback,
+                callback,
+            ),
+        }
     }
 
     /// Try opening a new OS-Sink with the builder's current stream configuration.
@@ -394,12 +443,19 @@ where
         let device = self.device.as_ref().expect("No output device specified");
         let error_callback = &self.error_callback;
 
-        MixerDeviceSink::open(device, &self.config, error_callback.clone()).or_else(|err| {
+        MixerDeviceSink::open_with_output_callback(
+            device,
+            &self.config,
+            error_callback.clone(),
+            self.output_callback.clone(),
+        )
+        .or_else(|err| {
             for supported_config in supported_output_configs(device)? {
                 if let Ok(handle) = DeviceSinkBuilder::default()
                     .with_device(device.clone())
                     .with_supported_config(&supported_config)
                     .with_error_callback(error_callback.clone())
+                    .with_shared_output_callback(self.output_callback.clone())
                     .open_stream()
                 {
                     return Ok(handle);
@@ -493,17 +549,31 @@ impl MixerDeviceSink {
     where
         E: FnMut(cpal::StreamError) + Send + 'static,
     {
+        Self::open_with_output_callback(device, config, error_callback, None)
+    }
+
+    fn open_with_output_callback<E>(
+        device: &cpal::Device,
+        config: &DeviceSinkConfig,
+        error_callback: E,
+        output_callback: Option<Arc<OutputBufferCallback>>,
+    ) -> Result<MixerDeviceSink, DeviceSinkError>
+    where
+        E: FnMut(cpal::StreamError) + Send + 'static,
+    {
         Self::validate_config(config);
         let (controller, source) = mixer(config.channel_count, config.sample_rate);
-        Self::init_stream(device, config, source, error_callback).and_then(|stream| {
-            stream.play().map_err(DeviceSinkError::PlayError)?;
-            Ok(Self {
-                _stream: stream,
-                mixer: controller,
-                config: *config,
-                log_on_drop: true,
-            })
-        })
+        Self::init_stream(device, config, source, error_callback, output_callback).and_then(
+            |stream| {
+                stream.play().map_err(DeviceSinkError::PlayError)?;
+                Ok(Self {
+                    _stream: stream,
+                    mixer: controller,
+                    config: *config,
+                    log_on_drop: true,
+                })
+            },
+        )
     }
 
     fn init_stream<S, E>(
@@ -511,12 +581,15 @@ impl MixerDeviceSink {
         config: &DeviceSinkConfig,
         mut samples: S,
         error_callback: E,
+        output_callback: Option<Arc<OutputBufferCallback>>,
     ) -> Result<cpal::Stream, DeviceSinkError>
     where
         S: Source + Send + 'static,
         E: FnMut(cpal::StreamError) + Send + 'static,
     {
         let cpal_config = config.into();
+        let channels = config.channel_count;
+        let sample_rate = config.sample_rate;
 
         macro_rules! build_output_streams {
             ($($sample_format:tt, $generic:ty);+) => {
@@ -524,13 +597,9 @@ impl MixerDeviceSink {
                     $(
                         cpal::SampleFormat::$sample_format => device.build_output_stream::<$generic, _, _>(
                             &cpal_config,
-                            move |data, _| {
-                                data.iter_mut().for_each(|d| {
-                                    *d = samples
-                                        .next()
-                                        .map(Sample::from_sample)
-                                        .unwrap_or(<$generic>::EQUILIBRIUM)
-                                })
+                            move |data, info| {
+                                output_observer::fill_buffer(data, &mut samples, channels, sample_rate,
+                                    info.timestamp(), output_callback.as_deref());
                             },
                             error_callback,
                             None,
