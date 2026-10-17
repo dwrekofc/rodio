@@ -13,6 +13,9 @@ use crate::source::SeekError;
 use crate::Float;
 use crate::{queue, source::Done, Source};
 
+mod render_observer;
+pub use render_observer::AppliedControls;
+
 /// Handle to a device that outputs sounds.
 ///
 /// Dropping the `Player` stops all its sounds. You can use `detach` if you want the sounds to continue
@@ -106,6 +109,31 @@ impl Player {
         S: Source + Send + 'static,
         f32: FromSample<S::Item>,
     {
+        self.append_observed(source, None);
+    }
+
+    /// Append a source with optional observation after each existing control update.
+    /// The callback runs on the source-pulling thread, before the next sample, about every
+    /// 5 ms in the source's current format. It does not report a native output frame or
+    /// speaker time. Its lifetime belongs to this appended source, not to the Player.
+    /// Keep the callback bounded and nonblocking; it must not retain or call the Player.
+    pub fn append_with_render_callback<S, F>(&self, source: S, callback: F)
+    where
+        S: Source + Send + 'static,
+        f32: FromSample<S::Item>,
+        F: FnMut(AppliedControls) + Send + 'static,
+    {
+        self.append_observed(source, Some(Box::new(callback)));
+    }
+
+    fn append_observed<S>(
+        &self,
+        source: S,
+        mut callback: Option<Box<dyn FnMut(AppliedControls) + Send>>,
+    ) where
+        S: Source + Send + 'static,
+        f32: FromSample<S::Item>,
+    {
         // Wait for the queue to flush then resume stopped playback
         if self.controls.stopped.load(Ordering::SeqCst) {
             if self.sound_count.load(Ordering::SeqCst) > 0 {
@@ -128,13 +156,16 @@ impl Player {
             .stoppable()
             // If you change the duration update the docs for try_seek!
             .periodic_access(Duration::from_millis(5), move |src| {
-                if controls.stopped.load(Ordering::SeqCst) {
+                let stopped = controls.stopped.load(Ordering::SeqCst);
+                if stopped {
                     src.stop();
                     *controls.position.lock().unwrap() = Duration::ZERO;
                 }
+                let cleared;
                 {
                     let mut to_clear = controls.to_clear.lock().unwrap();
-                    if *to_clear > 0 {
+                    cleared = *to_clear > 0;
+                    if cleared {
                         src.inner_mut().skip();
                         *to_clear -= 1;
                         *controls.position.lock().unwrap() = Duration::ZERO;
@@ -147,12 +178,21 @@ impl Player {
                 amp.set_factor(*controls.volume.lock().unwrap());
                 amp.inner_mut()
                     .set_paused(controls.pause.load(Ordering::SeqCst));
-                amp.inner_mut()
-                    .inner_mut()
-                    .inner_mut()
-                    .set_factor(*controls.speed.lock().unwrap());
+                let speed = *controls.speed.lock().unwrap();
+                amp.inner_mut().inner_mut().inner_mut().set_factor(speed);
                 if let Some(seek) = controls.seek.lock().unwrap().take() {
                     seek.attempt(amp)
+                }
+                if let Some(callback) = callback.as_mut() {
+                    callback(AppliedControls {
+                        position: amp.inner().inner().get_pos(),
+                        paused: amp.inner().is_paused(),
+                        speed,
+                        stopped,
+                        cleared,
+                        channels: amp.channels(),
+                        sample_rate: amp.sample_rate(),
+                    });
                 }
                 start_played.store(true, Ordering::SeqCst);
             });

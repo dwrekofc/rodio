@@ -216,7 +216,7 @@ pub use crate::common::{BitDepth, ChannelCount, Float, Sample, SampleRate};
 pub use crate::decoder::Decoder;
 #[cfg(feature = "experimental")]
 pub use crate::fixed_source::FixedSource;
-pub use crate::player::Player;
+pub use crate::player::{AppliedControls, Player};
 pub use crate::source::Source;
 pub use crate::spatial_player::SpatialPlayer;
 #[cfg(feature = "playback")]
