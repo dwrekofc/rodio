@@ -114,8 +114,9 @@ impl Player {
 
     /// Append a source with optional observation after each existing control update.
     /// The callback runs on the source-pulling thread, before the next sample, about every
-    /// 5 ms in the source's current format. It does not report a native output frame or
-    /// speaker time. Its lifetime belongs to this appended source, not to the Player.
+    /// nominal 5 ms source-control period. The existing period is calculated when the
+    /// wrapper is built and is not recomputed after speed/format changes. This reports
+    /// neither a native output frame nor speaker time. Its lifetime belongs to this appended source, not to the Player.
     /// Keep the callback bounded and nonblocking; it must not retain or call the Player.
     pub fn append_with_render_callback<S, F>(&self, source: S, callback: F)
     where
